@@ -1,13 +1,27 @@
 """
 Methods to run simulations and output data to a file for later analysis.
 
+TODO: 
+1. Broadly refactor. Specifically in periodic temperature swap and keep 
+a memo of inverses to beta_reloc that can be passed to methods.
+2. Test if agrees with previous results.
+3. Speed up. Specifically, investigate inline numba options. May also
+investigate CUDA random number generation if there is time.
+
 Author: Gabriel Peery
 Date: 6/7/2021
 """
-from numba import njit, prange
+import argparse
+import logging
+from numba import boolean, njit, prange
 import numpy as np
+import pandas as pd
 import time_logging
 from typing import Tuple
+
+
+numba_log = logging.getLogger("numba")
+numba_log.setLevel(logging.DEBUG)
 
 
 @njit
@@ -100,134 +114,148 @@ _STATE_DTYPE = np.dtype([
 IDX_DTYPE = np.dtype("i1") # Change if using more temperatures
 
 
-@njit
-def _init_rand_states(statesA : np.ndarray, statesB : np.ndarray):
+# Trying parallelization
+@njit(parallel=True)
+def _init_rand_states(states : np.ndarray):
     """Draws binding energies according to a Gaussian distribution with
     variance 1 and center 0 and randomizes initial spins.
 
     Effects:
-    Changes bindings and spins of both states arrays.
+        Changes bindings and spins of states, both pairs of sets.
     """
-    size = len(statesA[0])
+    size = len(states[0][0])
     rand_spins = np.random.choice(np.array([-1, 1]), size=(2, size, size, size))
     rand_binding = np.random.normal(0.0, 1.0, size=(2, 3, size, size, size))
-    for stateA, stateB in zip(statesA, statesB):
-        for x in range(size):
-            for y in range(size):
-                for z in range(size):
-                    stateA[x][y][z]["s"] = rand_spins[0][x][y][z]
-                    stateB[x][y][z]["s"] = rand_spins[1][x][y][z]
-                    stateA[x][y][z]["r"] = rand_binding[0][0][x][y][z]
-                    stateB[x][y][z]["r"] = rand_binding[1][0][x][y][z]
-                    stateA[x][y][z]["d"] = rand_binding[0][1][x][y][z]
-                    stateB[x][y][z]["d"] = rand_binding[1][1][x][y][z]
-                    stateA[x][y][z]["i"] = rand_binding[0][2][x][y][z]
-                    stateB[x][y][z]["i"] = rand_binding[1][2][x][y][z]
+    for stateA, stateB in zip(states[0], states[1]):
+        for x in prange(size):
+            for y in prange(size):
+                for z in prange(size):
+                    stateA[x][y][z].s = rand_spins[0][x][y][z]
+                    stateB[x][y][z].s = rand_spins[1][x][y][z]
+                    stateA[x][y][z].r = rand_binding[0][0][x][y][z]
+                    stateB[x][y][z].r = rand_binding[1][0][x][y][z]
+                    stateA[x][y][z].d = rand_binding[0][1][x][y][z]
+                    stateB[x][y][z].d = rand_binding[1][1][x][y][z]
+                    stateA[x][y][z].i = rand_binding[0][2][x][y][z]
+                    stateB[x][y][z].i = rand_binding[1][2][x][y][z]
 
 
 # Trying parallelization
 @njit(parallel=True)
 def _calc_energies(
-        stA : np.ndarray,
-        stB : np.ndarray,
-        energiesA : np.ndarray,
-        energiesB : np.ndarray
+        ss : np.ndarray,
+        energies : np.ndarray
     ):
-    """For each state in stA and stB are the same size, calculate the 
-    energies and put them in the provided arrays.
+    """For each pair of states in ss, calculate the energies and put 
+    them in the provided array.
     
     Effects:
-        Modifies supplied energy arrays.
+        Modifies supplied energy array.
     """
-    size = len(states[0])
-    for i in prange(len(stA)):
-        energiesA[i] = energiesB[i] = 0
+    size = len(ss[0][0])
+    for i in prange(len(ss[0])):
+        energies[0][i] = energies[1][i] = 0
         for x in prange(size):
             for y in prange(size):
                 for z in prange(size):
-                    energiesA[i] += (stA[i][x][y][z]["s"] * (
-                        (stA[i][x][y][z]["r"]*stA[i][(x+1)%size][y][z]["s"])
-                        + (stA[i][x][y][z]["d"]*stA[i][x][(y+1)%size][z]["s"])
-                        + (stA[i][x][y][z]["i"]*stA[i][x][y][(z+1)%size]["s"])
+                    energies[0][i] += (ss[0][i][x][y][z].s * (
+                        (ss[0][i][x][y][z].r*ss[0][i][(x+1)%size][y][z].s)
+                        + (ss[0][i][x][y][z].d*ss[0][i][x][(y+1)%size][z].s)
+                        + (ss[0][i][x][y][z].i*ss[0][i][x][y][(z+1)%size].s)
                     ))
-                    energiesB[i] += (stB[i][x][y][z]["s"] * (
-                        (stB[i][x][y][z]["r"]*stB[i][(x+1)%size][y][z]["s"])
-                        + (stB[i][x][y][z]["d"]*stB[i][x][(y+1)%size][z]["s"])
-                        + (stB[i][x][y][z]["i"]*stB[i][x][y][(z+1)%size]["s"])
+                    energies[1][i] += (ss[1][i][x][y][z].s * (
+                        (ss[1][i][x][y][z].r*ss[1][i][(x+1)%size][y][z].s)
+                        + (ss[1][i][x][y][z].d*ss[1][i][x][(y+1)%size][z].s)
+                        + (ss[1][i][x][y][z].i*ss[1][i][x][y][(z+1)%size].s)
                     ))
 
 
-# Trying parallelization
-@njit(parallel=True)
-def _calc_overlaps(
-        stA : np.ndarray,
-        stB : np.ndarray,
-        spin_overlap : np.ndarray,
-        link_overlap : np.ndarray
-    ):
-    """For each state in stA and stB are the same size, calculate the 
-    overlaps index by index.
-    
-    Effects:
-        Modifies supplied overlap arrays.
+@njit
+def _calc_change(st : np.ndarray, c : np.ndarray) -> float:
+    """Returns the change in energy that would occur if the site in the
+    state st at coordinate c were flipped.
     """
-    size = len(states[0])
-    for i in prange(len(stA)):
-        spin_overlap[i] = link_overlap[i] = 0.0
-        for x in prange(size):
-            for y in prange(size):
-                for z in prange(size):
-                    spin_overlap[i] += (
-                        stA[i][x][y][z]["s"] * stB[i][x][y][z]["s"]
-                    )
-                    # TODO - Replace with _calc_ss_overlap call?
-                    link_overlap[i] += (
-                        stA[i][x][y][z]["s"] * stB[i][x][y][z]["s"] * (
-                        stA[i][(x+1)%size][y][z]["s"]*stB[i][(x+1)%size][y][z]
-                        + stA[i][x][(y+1)%size][z]["s"]*stB[i][x][(y+1)%size][z]
-                        + stA[i][x][y][(z+1)%size]["s"]*stB[i][x][y][(z+1)%size]
-                        )
-                    )
+    s = len(st)
+    return -2 * st[c[0]][c[1]][c[2]].s * (
+        st[c[0]][c[1]][c[2]].r*st[(c[0]+1)%s][c[1]][c[2]].s
+        + st[c[0]][c[1]][c[2]].d*st[c[0]][(c[1]+1)%s][c[2]].s
+        + st[c[0]][c[1]][c[2]].i*st[c[0]][c[1]][(c[2]+1)%s].s
+        + st[(c[0]-1)%s][c[1]][c[2]].r*st[(c[0]-1)%s][c[1]][c[2]].s
+        + st[c[0]][(c[1]-1)%s][c[2]].d*st[c[0]][(c[1]-1)%s][c[2]].s
+        + st[c[0]][c[1]][(c[2]-1)%s].i*st[c[0]][c[1]][(c[2]-1)%s].s
+    )
 
 
 @njit
 def _calc_ss_overlap(
-        stateA : np.ndarray,
-        stateB : np.ndarray,
-        c : np.ndarray
+        stA : np.ndarray,
+        stB : np.ndarray,
+        x : int,
+        y : int,
+        z : int
     ) -> float:
     """Calculates the contribution of a single site to the link overlap.
-    Returns that contribution. c is the coordinate.
+    Returns that contribution.
     """
-    s = len(stateA)
+    s = len(stA)
     return (
-        stateA[c[0]][c[1]][c[2]]["s"] * stateB[c[0]][c[1]][c[2]]["s"] * (
-        stateA[(c[0]+1)%s][c[1]][c[2]]["s"]*stateB[(c[0]+1)%s][c[1]][c[2]]
-        + stateA[c[0]][(c[1]+1)%s][c[2]]["s"]*stateB[c[0]][(c[1]+1)%s][c[2]]
-        + stateA[c[0]][c[1]][(c[2]+1)%s]["s"]*stateB[c[0]][c[1]][(c[2]+1)%s]
+        stA[x][y][z].s * stB[x][y][z].s * (
+        (stA[(x+1)%s][y][z].s*stB[(x+1)%s][y][z].s)
+        + (stA[x][(y+1)%s][z].s*stB[x][(y+1)%s][z].s)
+        + (stA[x][y][(z+1)%s].s*stB[x][y][(z+1)%s].s)
         )
     )
 
 
 # Trying parallelization
 @njit(parallel=True)
+def _calc_overlaps(
+        ss : np.ndarray,
+        spin_overlap : np.ndarray,
+        link_overlap : np.ndarray,
+        beta_reloc : np.ndarray,
+        idx_trace : np.ndarray
+    ):
+    """For pairs of states in ss, calculate the overlaps index by index.
+    Requires an array to store index transformations for reasons of
+    parallelization.
+    
+    Effects:
+        Modifies supplied overlap arrays.
+    """
+    size = len(ss[0][0])
+    for i in prange(len(ss[0])):
+        spin_overlap[i] = link_overlap[i] = 0.0
+        idx_trace[i][0] = np.where(beta_reloc[0] == i)[0][0]
+        idx_trace[i][1] = np.where(beta_reloc[1] == i)[0][0]
+        for x in prange(size):
+            for y in prange(size):
+                for z in prange(size):
+                    spin_overlap[i] += (
+                        ss[0][idx_trace[i][0]][x][y][z].s 
+                        * ss[1][idx_trace[i][1]][x][y][z].s
+                    )
+                    link_overlap[i] += _calc_ss_overlap(
+                        ss[0][idx_trace[i][0]], ss[1][idx_trace[i][1]], x, y, z
+                    )
+
+
+# Trying parallelization
+@njit(parallel=True)
 def _mc_step(
-        stA : np.ndarray,
-        stB : np.ndarray,
+        ss : np.ndarray,
         betas : np.ndarray,
-        betaA_reloc : np.ndarray,
-        betaB_reloc : np.ndarray,
+        beta_reloc : np.ndarray,
         cs : np.ndarray,
         uniforms : np.ndarray,
         do_swaps : np.ndarray,
         changes : np.ndarray,
-        energiesA : np.ndarray,
-        energiesB : np.ndarray,
+        energies : np.ndarray,
         spin_overlap : np.ndarray,
         link_overlap : np.ndarray,
         site_overlap : np.ndarray
     ):
-    """Given states, information to get their temperatures, and some
+    """Given states ss, information to get their temperatures, and some
     random values to use, performs a Metropolis-Hastings Monte Carlo
     step on all of them and updates quantities accordingly. The cs array 
     is of random coordinates. Also requires arrays to keep booleans, 
@@ -235,71 +263,108 @@ def _mc_step(
 
     Effects:
         May swap spins in states.
-        Updates energiesA, energiesB, spin_overlap, link_overlap.
+        Updates energies, spin_overlap, link_overlap.
         Modifies parallelization utility arrays
     """
-    # Loop over state indices
-    for sti in prange(len(stA)):
+    # Loop over beta indices
+    for bi in prange(len(ss[0])):
+        # We need to convert the beta index to state indices in A and B
+        # We'll deal only with those coordinates for overlap calculation
+        siA = np.where(beta_reloc[0] == bi)[0][0]
+        siB = np.where(beta_reloc[0] == bi)[0][0]
+
         # Record old overlap in neighborhood of both coords
-        coords_same = (cs[0][sti] == cs[1][sti]).all()
+        coords_same = (cs[0][siA] == cs[1][siB]).all()
         if coords_same:
-            site_overlap[sti] = _calc_ss_overlap(stA[sti], stB[sti], cs[0][sti])
+            site_overlap[bi] = _calc_ss_overlap(
+                ss[0][siA],ss[1][siB],cs[0][siA][0],cs[0][siA][1],cs[0][siA][2]
+            )
         else:
-            site_overlap[sti] = (
-                _calc_ss_overlap(stA[sti], stB[sti], cs[0][sti])
-                + _calc_ss_overlap(stA[sti], stB[sti], cs[1][sti])
+            site_overlap[bi] = (
+                _calc_ss_overlap(
+                    ss[0][siA],
+                    ss[1][siB],
+                    cs[0][siA][0],
+                    cs[0][siA][1],
+                    cs[0][siA][2]
+                )
+                + _calc_ss_overlap(
+                    ss[0][siA],
+                    ss[1][siB],
+                    cs[1][siB][0],
+                    cs[1][siB][1],
+                    cs[1][siB][2]
+                )
             )
 
         # Check if non-positive
-        changes[0][sti] = _calc_change(stA[sti], cs[0][sti])
-        changes[1][sti] = _calc_change(stB[sti], cs[0][sti])
-        do_swaps[0][sti] = (changes[0][sti] <= 0)
-        do_swaps[1][sti] = (changes[1][sti] <= 0)
+        changes[0][siA] = _calc_change(ss[0][siA], cs[0][siA])
+        changes[1][siB] = _calc_change(ss[1][siB], cs[1][siB])
+        do_swaps[0][siA] = (changes[0][siA] <= 0)
+        do_swaps[1][siB] = (changes[1][siB] <= 0)
 
         # If positive, use the uniforms
-        if not do_swaps[0][sti]:
-            do_swaps[0][sti] = (uniforms[0][sti] < np.exp(
-                -betas[betaA_reloc[sti]] * changes[0][sti]
+        if not do_swaps[0][siA]:
+            do_swaps[0][siA] = (uniforms[0][siA] < np.exp(
+                -betas[bi] * changes[0][siA]
             ))
-        if not do_swaps[1][sti]:
-            do_swaps[1][sti] = (uniforms[1][sti] < np.exp(
-                -betas[betaB_reloc[sti]] * changes[1][sti]
+        if not do_swaps[1][siB]:
+            do_swaps[1][siB] = (uniforms[1][siB] < np.exp(
+                -betas[bi] * changes[1][siB]
             ))
 
         # Perform swaps, update energy info
-        if do_swaps[0][sti]:
-            stA[sti][cs[0][sti][0]][cs[0][sti][1]][cs[0][sti][2]]["s"] *= -1
-            energiesA[sti] += changes[0][sti]
-        if do_swaps[1][sti]:
-            stB[sti][cs[1][sti][0]][cs[1][sti][1]][cs[1][sti][2]]["s"] *= -1
-            energiesB[sti] += changes[1][sti]
+        if do_swaps[0][siA]:
+            ss[0][siA][cs[0][siA][0]][cs[0][siA][1]][cs[0][siA][2]].s *= -1
+            energies[0][siA] += changes[0][siA]
+        if do_swaps[1][siB]:
+            ss[1][siB][cs[1][siB][0]][cs[1][siB][1]][cs[1][siB][2]].s *= -1
+            energies[1][siB] += changes[1][siB]
 
         # Update overlaps
         if coords_same:
-            if not (do_swaps[0][sti] and do_swaps[1][sti]):
-                spin_overlap[sti] -= 2 * (
-                    stB[sti][cs[1][sti][0]][cs[1][sti][1]][cs[1][sti][2]]["s"]
-                    *stA[sti][cs[0][sti][0]][cs[0][sti][1]][cs[0][sti][2]]["s"] 
+            if not (do_swaps[0][siA] and do_swaps[1][siB]):
+                spin_overlap[bi] -= 2 * (
+                    ss[1][siB][cs[1][siB][0]][cs[1][siB][1]][cs[1][siB][2]].s
+                    *ss[0][siA][cs[0][siA][0]][cs[0][siA][1]][cs[0][siA][2]].s 
                 )
-            link_overlap[sti] += (
-                _calc_ss_overlap(stA[sti], stB[sti], cs[0][sti])
-                - site_overlap[sti]
+            link_overlap[bi] += (
+                _calc_ss_overlap(
+                    ss[0][siA],
+                    ss[1][siB],
+                    cs[0][siA][0],
+                    cs[0][siA][1],
+                    cs[0][siA][2]
+                )
+                - site_overlap[bi]
             )
         else:
-            if do_swaps[0][sti]:
-                spin_overlap[sti] -= 2 * (
-                    stA[sti][cs[0][sti][0]][cs[0][sti][1]][cs[0][sti][2]]["s"]
-                    *stB[sti][cs[0][sti][0]][cs[0][sti][1]][cs[0][sti][2]]["s"] 
+            if do_swaps[0][siA]:
+                spin_overlap[bi] -= 2 * (
+                    ss[0][siA][cs[0][siA][0]][cs[0][siA][1]][cs[0][siA][2]].s
+                    *ss[1][siB][cs[0][siA][0]][cs[0][siA][1]][cs[0][siA][2]].s 
                 )
-            if do_swaps[1][sti]:
-                spin_overlap[sti] -= 2 * (
-                    stA[sti][cs[1][sti][0]][cs[1][sti][1]][cs[1][sti][2]]["s"]
-                    *stB[sti][cs[1][sti][0]][cs[1][sti][1]][cs[1][sti][2]]["s"] 
+            if do_swaps[1][siB]:
+                spin_overlap[bi] -= 2 * (
+                    ss[0][siA][cs[1][siB][0]][cs[1][siB][1]][cs[1][siB][2]].s
+                    *ss[1][siB][cs[1][siB][0]][cs[1][siB][1]][cs[1][siB][2]].s 
                 )
-            link_overlap[sti] += ((
-                _calc_ss_overlap(stA[sti], stB[sti], cs[0][sti])
-                + _calc_ss_overlap(stA[sti], stB[sti], cs[1][sti])
-            ) - site_overlap[sti])
+            link_overlap[bi] += ((
+                _calc_ss_overlap(
+                    ss[0][siA],
+                    ss[1][siB],
+                    cs[0][siA][0],
+                    cs[0][siA][1],
+                    cs[0][siA][2]
+                )
+                + _calc_ss_overlap(
+                    ss[0][siA],
+                    ss[1][siB],
+                    cs[1][siB][0],
+                    cs[1][siB][1],
+                    cs[1][siB][2]
+                )
+            ) - site_overlap[bi])
 
 
 @time_logging.print_time
@@ -324,35 +389,31 @@ def ptmc(
 
     Returns some arrays with encountered values of spin and link overlap
     """
-    # TODO - Replace A/B variables with additional dimension?
-    # TODO - Make overlaps temperature based
     #
     # Memory allocation, startup
     #
-    statesA = np.zeros(
-        (len(betas), size, size, size),
-        dtype=_STATE_DTYPE
-    )
-    statesB = np.zeros(
-        (len(betas), size, size, size),
+    states = np.zeros(
+        (2, len(betas), size, size, size),
         dtype=_STATE_DTYPE
     )
 
     # Store the indices into betas of where to get beta of state at some
     # index. Stands for Beta _ Relocation
-    betaA_reloc = np.arange(len(betas), dtype=IDX_DTYPE)
-    betaB_reloc = np.arange(len(betas), dtype=IDX_DTYPE)
+    beta_reloc = np.zeros((2, len(betas)), dtype=IDX_DTYPE)
+    for i in range(len(betas)):
+        beta_reloc[0][i] = beta_reloc[1][i] = i
 
     # Will initialize quantities of interest in loop
-    energiesA = np.zeros(len(betas), dtype=BINDING_DTYPE)
-    energiesB = np.zeros(len(betas), dtype=BINDING_DTYPE)
+    energies = np.zeros((2, len(betas)), dtype=BINDING_DTYPE)
     # Note that for overlaps, we'll save scaling for later
     spin_overlap = np.zeros(len(betas), dtype=BINDING_DTYPE)
     link_overlap = np.zeros(len(betas), dtype=BINDING_DTYPE)
 
-    # Logistics, counts, useful variables
-    do_swaps = np.zeros((2, len(betas)), dtype=bool)
-    changes = np.zeros((2, len(betas)), dtype=BINDING_DTYPE) # Ephemera
+    # Logistics, counts, useful variables, ephemera arrays
+    do_swaps = np.zeros((2, len(betas)), dtype=boolean)
+    changes = np.zeros((2, len(betas)), dtype=BINDING_DTYPE)
+    site_overlap_tmp = np.zeros(len(betas), dtype=BINDING_DTYPE)
+    idx_trace = np.zeros((len(betas), 2), dtype=IDX_DTYPE)
     site_count = size ** 3
     real_sweeps = equilibriate_sweeps + sweeps
     sub_sweep_count = site_count * real_sweeps
@@ -370,31 +431,34 @@ def ptmc(
 
     # Generate randoms from start
     print("Generating randoms...")
-    rand_coords = np.random.randint(0, size, size=mc_shape)
-    mc_uniforms = np.random.rand(mc_shape)
+    rand_coords = np.random.randint(0, size, size=(*mc_shape, 3))
+    mc_uniforms = np.random.rand(*mc_shape)
     swap_idxs = np.random.randint(0, len(betas) - 1, size=swap_shape)
-    swap_uniforms = np.random.rand(swap_shape)
+    swap_uniforms = np.random.rand(*swap_shape)
     print("...finished randoms.")
 
     # Output quantities of interest
-    # Note that they are stored according to temperature (TODO - broken)
-    # and sample index and sweep index for multiple layers of averaging.
+    # Note that they are stored according to temperature and sample 
+    # index and sweep index for multiple layers of averaging.
     spin_overlap_hist = np.zeros((len(betas), samples, sweeps))
     link_overlap_hist = np.zeros((len(betas), samples, sweeps))
 
     #
     # Sampling loop
     #
-    print("Beginning Simulation with %i Monte Carlo Steps" % tot_mc_iters)
+    print("Beginning Simulation with "+str(tot_mc_iters)+" Monte Carlo Steps")
     for sai in range(samples): # Sample index
-        print("Running sample %i..." % sai)
+        print("Running sample " + str(sai) + "...")
 
         #
         # Initalize
         #
-        _init_rand_states(statesA, statesB)
-        _calc_energies(statesA, statesB, energiesA, energiesB)
-        _calc_overlaps(statesA, statesB, spin_overlap, link_overlap)
+        _init_rand_states(states)
+        _calc_energies(states, energies)
+        _calc_overlaps(
+            states, spin_overlap, link_overlap, beta_reloc, idx_trace
+        )
+        print("Init Complete")
 
         #
         # Sweeping loop
@@ -403,76 +467,80 @@ def ptmc(
             # Metropolis-Hastings Monte-Carlo
             for ssi in range(site_count): # Sub-sweep index
                 _mc_step(
-                    statesA,
-                    statesB,
+                    states,
                     betas,
-                    betaA_reloc,
-                    betaB_reloc,
+                    beta_reloc,
                     rand_coords[sai][swi][ssi],
                     mc_uniforms[sai][swi][ssi],
                     do_swaps,
                     changes,
-                    energies_A,
-                    energies_B,
+                    energies,
                     spin_overlap,
-                    link_overlap
+                    link_overlap,
+                    site_overlap_tmp
                 )
 
             # Record data after equilibrium phase
-            if swi >= real_eq_sweeps:
+            if swi >= equilibriate_sweeps:
                 # Record overlaps for histogram later
                 for beta_idx in range(len(betas)):
-                    spin_overlap_hist[betaA_reloc[beta_idx]][sai][swi] = (
-                        spin_overlap[betaA_reloc[beta_idx]]
+                    spin_overlap_hist[beta_reloc[0][beta_idx]][sai][swi] = (
+                        spin_overlap[beta_reloc[0][beta_idx]]
                     )
-                    link_overlap_hist[betaA_reloc[beta_idx]][sai][swi] = (
-                        link_overlap[betaA_reloc[beta_idx]]
+                    link_overlap_hist[beta_reloc[0][beta_idx]][sai][swi] = (
+                        link_overlap[beta_reloc[0][beta_idx]]
                     )
 
             # Periodic Temperature Swap
             quo, rem = np.divmod(swi, global_move_period)
             if rem == 0:
                 # Attempt swaps equal to number of betas
-                for swap_trial in range(len(betas)):
+                for swt in range(len(betas)): # Swap trial
                     # -=- A -=-
                     # Choose a pair to swap
-                    swap_idx = swap_idxs[sai][quo][swap_trial][0]
-                    low_i = np.where(betaA_reloc==swap_idx)[0][0]
-                    high_i = np.where(betaA_reloc==(swap_idx+1))[0][0]
+                    swap_idx = swap_idxs[sai][quo][swt][0]
+                    low_i = np.where(beta_reloc[0]==swap_idx)[0][0]
+                    high_i = np.where(beta_reloc[0]==(swap_idx+1))[0][0]
                     # Accept or reject based on boltzmann factor
                     exponent = (
-                        -energiesA[low_i]*betas[betaA_reloc[high_i]]
-                        -energiesA[high_i]*betas[betaA_reloc[low_i]]
-                        +energiesA[low_i]*betas[betaA_reloc[low_i]]
-                        +energiesA[high_i]*betas[betaA_reloc[high_i]]
+                        -energies[0][low_i]*betas[beta_reloc[0][high_i]]
+                        -energies[0][high_i]*betas[beta_reloc[0][low_i]]
+                        +energies[0][low_i]*betas[beta_reloc[0][low_i]]
+                        +energies[0][high_i]*betas[beta_reloc[0][high_i]]
                     )
-                    if (exponent >= 1) or (swap_uniforms <= np.exp(exponent)):
-                        betaA_reloc[low_i], betaA_reloc[high_i] = (
-                            betaA_reloc[high_i],
-                            betaA_reloc[low_i]
+                    if (
+                        (exponent >= 1)
+                        or (swap_uniforms[sai][quo][swt][0] <= np.exp(exponent))
+                    ):
+                        beta_reloc[0][low_i], beta_reloc[0][high_i] = (
+                            beta_reloc[0][high_i],
+                            beta_reloc[0][low_i]
                         )
 
                     # -=- B -=-
                     # Choose a pair to swap
-                    swap_idx = swap_idxs[sai][quo][swap_trial][1]
-                    low_i = np.where(betaB_reloc==swap_idx)[0][0]
-                    high_i = np.where(betaB_reloc==(swap_idx+1))[0][0]
+                    swap_idx = swap_idxs[sai][quo][swt][1]
+                    low_i = np.where(beta_reloc[1]==swap_idx)[0][0]
+                    high_i = np.where(beta_reloc[1]==(swap_idx+1))[0][0]
                     # Accept or reject based on boltzmann factor
                     exponent = (
-                        -energiesB[low_i]*betas[betaB_reloc[high_i]]
-                        -energiesB[high_i]*betas[betaB_reloc[low_i]]
-                        +energiesB[low_i]*betas[betaB_reloc[low_i]]
-                        +energiesB[high_i]*betas[betaB_reloc[high_i]]
+                        -energies[1][low_i]*betas[beta_reloc[1][high_i]]
+                        -energies[1][high_i]*betas[beta_reloc[1][low_i]]
+                        +energies[1][low_i]*betas[beta_reloc[1][low_i]]
+                        +energies[1][high_i]*betas[beta_reloc[1][high_i]]
                     )
-                    if (exponent >= 1) or (swap_uniforms <= np.exp(exponent)):
-                        betaB_reloc[low_i], betaB_reloc[high_i] = (
-                            betaB_reloc[high_i],
-                            betaB_reloc[low_i]
+                    if (
+                        (exponent >= 1)
+                        or (swap_uniforms[sai][quo][swt][1] <= np.exp(exponent))
+                    ):
+                        beta_reloc[1][low_i], beta_reloc[1][high_i] = (
+                            beta_reloc[1][high_i],
+                            beta_reloc[1][low_i]
                         )
 
-        print("...finished sample %i." % sai)
+        print("...finished sample.")
 
-    return statesA
+    return spin_overlap_hist, link_overlap_hist
 
 
 def ea_main():
@@ -481,8 +549,81 @@ def ea_main():
 
 
 def ptmc_main():
-    print("Starting Parallel Tempering Monte Carlo.")
-    ptmc(5, 1, 1, np.ones(10), 100, 10)
+    # Parse Arguments
+    print("Parsing arguments...")
+    parser = argparse.ArgumentParser(
+        description="Run a Parallel-Tempering Monte Carlo simulation of "
+                    "an Edwards-Anderson model in 3D."
+    )
+    parser.add_argument("size", type=int, help="Side length of cube.")
+    parser.add_argument(
+        "samples",
+        type=int,
+        help="Number of binding configs to sample"
+    )
+    parser.add_argument(
+        "sweeps",
+        type=int,
+        help="Metropolis-Hastings iterations per binding config."
+    )
+    parser.add_argument(
+        "global_move_period",
+        type=int,
+        help="Attempt temperature swapping every this iterations."
+    )
+    parser.add_argument(
+        "equilibriate_sweeps",
+        type=int,
+        help="Iterations to calm down."
+    )
+    parser.add_argument(
+        "out_name",
+        type=str,
+        help="Filename to output results to, should be a .csv."
+    )
+    args = parser.parse_args()
+    size = args.size
+    samples = args.samples
+    sweeps = args.sweeps
+    global_move_period = args.global_move_period
+    equilibriate_sweeps = args.equilibriate_sweeps
+    out_name = args.out_name
+    print("...finished parsing arguments.")
+
+    # Run simulation
+    print("Starting Parallel Tempering Monte Carlo...")
+    betas = np.linspace(0.2, 1.1, 10)
+    spin_overlap_hist, link_overlap_hist = ptmc(
+        size,
+        samples,
+        sweeps,
+        betas,
+        global_move_period,
+        equilibriate_sweeps
+    )
+    print("...finished Monte Carlo.")
+
+    # Write to file
+    print(f'Writing to file "{out_name}"...')
+    output_data = pd.DataFrame({
+        "Beta" : [],
+        "SampleID" : [],
+        "SweepID" : [],
+        "SpinOverlap" : [],
+        "LinkOverlap" : []
+    })
+    for beta, s1, l1 in zip(betas, spin_overlap_hist, link_overlap_hist):
+        for sai in range(len(s1)): # Sample index
+            for swi in range(len(s1[sai])): # Sweep index
+                output_data = output_data.append({
+                    "Beta" : beta,
+                    "SampleID" : sai,
+                    "SweepID" : swi,
+                    "SpinOverlap" : s1[sai][swi],
+                    "LinkOverlap" : l1[sai][swi]
+                }, ignore_index=True)
+    output_data.to_csv(out_name, index=False)
+    print("...finished writing to file.")
 
 
 if __name__ == "__main__":
