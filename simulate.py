@@ -339,6 +339,7 @@ def attempt_swap(
         bts[low_i], bts[high_i] = bts[high_i], bts[low_i]
 
 
+# Initial averaging period will be over first 2**START_POWER iterations
 START_POWER = 5
 
 @time_logging.print_time
@@ -385,7 +386,7 @@ def ptmc(
     spin_overlap = np.zeros(len(betas), dtype=OVERLAP_DTYPE)
     link_overlap = np.zeros(len(betas), dtype=OVERLAP_DTYPE)
 
-    # Logistics, counts, useful variables, ephemera arrays
+    # Useful quantities and other variables
     site_count = size ** 3
     real_sweeps = warmup_sweeps + sweeps
     sub_sweep_count = site_count * real_sweeps
@@ -401,7 +402,9 @@ def ptmc(
     #
     # Output quantities of interest (qoi)
     #
-    # First is the prediction of link overlap from average energy
+    # First is the prediction of link overlap from average energy, it
+    # will be an average energy until end when it is converted to a
+    # prediction of link overlap.
     # Second is the observed link overlap
     # Starts as a sum of averages, then averaged again at the end.
     time_ev_tbls = np.zeros(
@@ -430,7 +433,7 @@ def ptmc(
     spin_tbl = np.zeros((len(betas), q_bin_count), dtype=HIST_COUNTER_DTYPE)
     link_tbl = np.zeros((len(betas), ql_bin_count), dtype=HIST_COUNTER_DTYPE)
 
-    # Acceptance frequencies
+    # Acceptance frequencies for temperature swaps
     accepted = np.zeros(len(betas) - 1, dtype=HIST_COUNTER_DTYPE)
     attempts = np.zeros(len(betas) - 1, dtype=HIST_COUNTER_DTYPE)
 
@@ -451,7 +454,8 @@ def ptmc(
             avg_energies[bi] = avg_ql[bi] = 0.0
 
         #
-        # Initalize
+        # Initalize - draw overlaps from normal distribution, spins
+        # in random directions
         #
         init_rand_states(states)
         calc_energies(states, energies)
@@ -583,33 +587,6 @@ def ptmc(
     spin_hist_tbl = spin_tbl / (samples * sweeps)
     link_hist_tbl = link_tbl / (samples * sweeps)
     return time_ev_tbls, spin_hist_tbl, link_hist_tbl, (accepted / attempts)
-
-
-def alt_plot(link_overlap_hist):
-    l1 = link_overlap_hist[0]
-    ql_avgs = [0] * len(l1[0])
-    for sai in range(len(l1)):
-        for swi in range(len(l1[sai])):
-            ql_avgs[swi] += l1[sai][swi]
-    with open(out_name, "w") as fd:
-        fd.write("Avg\n")
-        for swi in range(len(l1[0])):
-            ql_avgs[swi] /= (27 * 6 * len(l1))
-            fd.write(f"{ql_avgs[swi]}\n")
-
-    
-def old_file_write(out_name, betas, spin_overlap_hist, link_overlap_hist):
-    # Write to file
-    print(f'Writing to file "{out_name}"...')
-    with open(out_name, "w") as fd:
-        fd.write("Beta,SampleID,SweepID,SpinOverlap,LinkOverlap\n")
-        for beta, s1, l1 in zip(betas, spin_overlap_hist, link_overlap_hist):
-            for sai in range(len(s1)): # Sample index
-                for swi in range(len(s1[sai])): # Sweep index
-                    fd.write(
-                        f"{beta:.3},{sai},{swi},{s1[sai][swi]},{l1[sai][swi]}\n"
-                    );
-    print("...finished writing to file.")
 
 
 def ptmc_main():
