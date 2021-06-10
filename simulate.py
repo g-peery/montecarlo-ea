@@ -4,9 +4,8 @@ Directory operations only work on Windows, systems with '\\' separators.
 
 Note that the global_move_period should be small.
 
-TODO: 
-    1. Fix energy prediction problem
-    2. Allow specify temperature range
+Notable flaws: 
+    1. Energy prediction results don't make sense.
 
 Author: Gabriel Peery
 Date: 6/9/2021
@@ -495,7 +494,6 @@ def ptmc(
                 # Time Evolution Tables
                 # Contribute to average (starting as sums)
                 for bi in range(len(betas)):
-                    # TODO - test absolutes here if necessary
                     avg_energies[bi] += (
                         energies[0][bts[0][bi]]
                         + energies[1][bts[1][bi]]
@@ -507,7 +505,6 @@ def ptmc(
                 if era_counter == era_len:
                     # Add to table
                     for bi in range(len(betas)):
-                        # TODO - test absolutes here if necessary
                         time_ev_tbls[0][bi][era] += avg_energies[bi] / era_len
                         #time_ev_tbls[0][bi][era] += 1 - (
                             #pred_norms[bi] * np.abs(avg_energies[bi]) / era_len
@@ -564,7 +561,6 @@ def ptmc(
         if era_counter != 0:
             # Add to table
             for bi in range(len(betas)):
-                # TODO - change if necessary
                 time_ev_tbls[0][bi][era] += avg_energies[bi] / era_counter
                 #time_ev_tbls[0][bi][era] += 1 - (
                     #pred_norms[bi] * np.abs(avg_energies[bi]) / era_counter
@@ -578,7 +574,6 @@ def ptmc(
     #
     # Turn into average
     time_ev_tbls /= samples
-    # TODO - a small test, change to the prediction
     for x in range(len(time_ev_tbls[0])):
         for y in range(len(time_ev_tbls[0][x])):
             time_ev_tbls[0][x][y] = 1 - (
@@ -646,6 +641,16 @@ def ptmc_main():
         help="Iterations to calm down."
     )
     parser.add_argument(
+        "min_temp",
+        type=float,
+        help="Minimum temperature"
+    )
+    parser.add_argument(
+        "max_temp",
+        type=float,
+        help="Maximum temperature"
+    )
+    parser.add_argument(
         "temp_count",
         type=int,
         help="Number of temperatures in range"
@@ -661,6 +666,8 @@ def ptmc_main():
     sweeps = args.sweeps
     global_move_period = args.global_move_period
     warmup_sweeps = args.warmup_sweeps
+    min_temp = args.min_temp
+    max_temp = args.max_temp
     temp_count = args.temp_count
     out_name = args.out_name
     print("...finished parsing arguments.")
@@ -677,10 +684,12 @@ def ptmc_main():
             "sweeps" : sweeps,
             "global_move_period" : global_move_period,
             "warmup_sweeps" : warmup_sweeps,
+            "min_temp" : max_temp,
+            "max_temp" : max_temp,
             "temp_count" : temp_count
         }, config)
     # Write meta.csv
-    temps = np.linspace(0.2, 2.0, temp_count)
+    temps = np.linspace(min_temp, max_temp, temp_count)
     betas = temps ** (-1)
     with open(out_name + r"\meta.csv", "w") as meta:
         meta.write("Index,Beta,Temperature\n")
