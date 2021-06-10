@@ -2,17 +2,11 @@
 Methods to run simulations and output data to a file for later analysis.
 Directory operations only work on Windows, systems with '\\' separators.
 
-Note that the global_move_period should be very small.
-
-Recently changed overlaps to be beta-index based.
+Note that the global_move_period should be small.
 
 TODO: 
-1. Test if agrees with previous results.
-2. Speed up. Specifically, investigate inline numba options. May also
-investigate CUDA random number generation if there is time.
-3. Use the new paper for beta selection techniques, work on the Jupyter
-notebook, figure out how everything should look, adapt how data is
-collected through the process to get what is needed.
+    1. Fix energy prediction problem
+    2. Allow specify temperature range
 
 Author: Gabriel Peery
 Date: 6/9/2021
@@ -39,6 +33,8 @@ IDX_DTYPE = np.dtype("i1") # Change if using more temperatures
 
 HIST_COUNTER_DTYPE = np.dtype("u8") # Expected need up to 12.15e9
 
+OVERLAP_DTYPE = np.dtype("i2")
+
 
 @njit
 def get_blank_states(size : int, beta_count : int) -> np.ndarray:
@@ -61,19 +57,19 @@ def init_rand_states(states : np.ndarray):
     """
     size = len(states[0][0])
     rand_spins = np.random.choice(np.array([-1, 1]), size=(2, size, size, size))
-    rand_binding = np.random.normal(0.0, 1.0, size=(2, 3, size, size, size))
+    rand_binding = np.random.normal(0.0, 1.0, size=(3, size, size, size))
     for stateA, stateB in zip(states[0], states[1]):
         for x in prange(size):
             for y in prange(size):
                 for z in prange(size):
                     stateA[x][y][z].s = rand_spins[0][x][y][z]
                     stateB[x][y][z].s = rand_spins[1][x][y][z]
-                    stateA[x][y][z].r = rand_binding[0][0][x][y][z]
-                    stateB[x][y][z].r = rand_binding[1][0][x][y][z]
-                    stateA[x][y][z].d = rand_binding[0][1][x][y][z]
-                    stateB[x][y][z].d = rand_binding[1][1][x][y][z]
-                    stateA[x][y][z].i = rand_binding[0][2][x][y][z]
-                    stateB[x][y][z].i = rand_binding[1][2][x][y][z]
+                    stateA[x][y][z].r = rand_binding[0][x][y][z]
+                    stateB[x][y][z].r = rand_binding[0][x][y][z]
+                    stateA[x][y][z].d = rand_binding[1][x][y][z]
+                    stateB[x][y][z].d = rand_binding[1][x][y][z]
+                    stateA[x][y][z].i = rand_binding[2][x][y][z]
+                    stateB[x][y][z].i = rand_binding[2][x][y][z]
 
 
 @njit(parallel=True)
@@ -95,12 +91,12 @@ def calc_energies(
         for x in prange(size):
             for y in prange(size):
                 for z in prange(size):
-                    energies[0][i] += (ss[0][i][x][y][z].s * (
+                    energies[0][i] -= (ss[0][i][x][y][z].s * (
                         (ss[0][i][x][y][z].r*ss[0][i][(x+1)%size][y][z].s)
                         + (ss[0][i][x][y][z].d*ss[0][i][x][(y+1)%size][z].s)
                         + (ss[0][i][x][y][z].i*ss[0][i][x][y][(z+1)%size].s)
                     ))
-                    energies[1][i] += (ss[1][i][x][y][z].s * (
+                    energies[1][i] -= (ss[1][i][x][y][z].s * (
                         (ss[1][i][x][y][z].r*ss[1][i][(x+1)%size][y][z].s)
                         + (ss[1][i][x][y][z].d*ss[1][i][x][(y+1)%size][z].s)
                         + (ss[1][i][x][y][z].i*ss[1][i][x][y][(z+1)%size].s)
@@ -113,7 +109,7 @@ def calc_energy_change(st : np.ndarray, c : np.ndarray) -> float:
     state st at coordinate c were flipped.
     """
     s = len(st)
-    return -2 * st[c[0]][c[1]][c[2]].s * (
+    return 2 * st[c[0]][c[1]][c[2]].s * (
         st[c[0]][c[1]][c[2]].r*st[(c[0]+1)%s][c[1]][c[2]].s
         + st[c[0]][c[1]][c[2]].d*st[c[0]][(c[1]+1)%s][c[2]].s
         + st[c[0]][c[1]][c[2]].i*st[c[0]][c[1]][(c[2]+1)%s].s
@@ -214,52 +210,42 @@ def calc_overlaps(
                     )
 
 
-# Is parallelization helpful here?
 @njit
 def _update_obs_tbls(
-        obs_tbls : np.ndarray,
+        spin_tbl : np.ndarray,
+        link_tbl : np.ndarray,
         spin_overlap : np.ndarray,
-        link_overlap : np.ndarray,
-        bin_end_q : np.ndarray,
-        bin_end_ql : np.ndarray
+        link_overlap : np.ndarray
     ):
     """Updates the observation tables according to overlaps."""
-    update_count = 0
-    for bini in range(len(bin_end_q) - 1): # Bin index
-        for bi in range(len(spin_overlap)): # Beta index
-            if bin_end_q[bini] <= spin_overlap[bi] < bin_end_q[bini + 1]:
-                obs_tbls[0][bi][bini] += 1
-                update_count += 1
-            if bin_end_ql[bini] <= link_overlap[bi] < bin_end_ql[bini + 1]:
-                obs_tbls[1][bi][bini] += 1
-                update_count += 1
-        if update_count == 2 * len(spin_overlap):
-            break
+    spin_offset = len(spin_tbl[0]) // 2
+    link_offset = len(link_tbl[0]) // 2
+    for bi, (spin, link) in enumerate(zip(spin_overlap, link_overlap)):
+        spin_tbl[bi][spin + spin_offset] += 1
+        link_tbl[bi][link + link_offset] += 1
 
 
 @njit
 def _mc_iter(
         # Arguments pertaining to only this iteration
         bi : int, # Index into betas
-        siA : int, # Index into states, first duplicate
-        siB : int, # Index into states, second duplicate
+        si : int, # Index into this context's states
         c : np.ndarray, # Coordinate
         uniform : float,
-        ind : int, # Which of state duplicates to index into
+        states : np.ndarray, # Only one half of copies
         # Global arguments
-        states : np.ndarray,
         betas : np.ndarray
-    ) -> Tuple[float, int]:
+    ) -> float:
     """Performs a single iteration of a monte carlo step with given
     indices into states and betas.
 
     Returns: 
-        Resulting change in energy and spin overlap
+        Resulting change in energy
     Effects:
         Flips the spin if accepted
     """
     # Check if non-positive
-    energy_change = calc_energy_change(states[ind][siA], c)
+    energy_change = calc_energy_change(states[si], c)
     do_swap = (energy_change <= 0)
 
     # If positive, use the uniform
@@ -267,17 +253,12 @@ def _mc_iter(
         do_swap = (uniform < np.exp(-betas[bi] * energy_change))
 
     # Perform swaps, update energy and spin overlap info
-    spin_change = 0
     if do_swap:
-        spin_change = -2 * (
-            states[ind][siA][c[0]][c[1]][c[2]].s 
-            * states[ind][siB][c[0]][c[1]][c[2]].s 
-        )
-        states[ind][siA][c[0]][c[1]][c[2]].s *= -1
+        states[si][c[0]][c[1]][c[2]].s *= -1
     else:
         energy_change = 0.0
 
-    return energy_change, spin_change
+    return energy_change
 
 
 @njit(parallel=True)
@@ -306,29 +287,23 @@ def mc_step(
         siA = bts[0][bi]
         siB = bts[1][bi]
         # A
-        energy_change, spin_change = _mc_iter(
+        energies[0][siA] += _mc_iter(
             bi,
             siA,
-            siB,
             cs[0][bi],
             uniforms[0][bi],
-            0,
-            ss,
+            ss[0],
             betas
         )
-        energies[0][siA] += energy_change
         # B
-        energy_change, spin_change = _mc_iter(
+        energies[1][siB] += _mc_iter(
             bi,
             siB,
-            siA,
             cs[1][bi],
             uniforms[1][bi],
-            1,
-            ss,
+            ss[1],
             betas
         )
-        energies[1][siB] += energy_change
 
 
 @njit
@@ -338,7 +313,9 @@ def attempt_swap(
         betas : np.ndarray,
         bts : np.ndarray,
         stb : np.ndarray,
-        swap_uniform : float
+        swap_uniform : float,
+        accepted : np.ndarray,
+        attempts : np.ndarray
     ):
     """Given a random index at which to swap temperatures in the betas
     array, attempts a swap.
@@ -347,20 +324,23 @@ def attempt_swap(
     # that will swap
     low_i = bsi
     high_i = bsi + 1
+    attempts[low_i] += 1
     # Accept or reject based on boltzmann factor
     exponent = (
         (betas[low_i] - betas[high_i])
         * (energies[bts[low_i]] - energies[bts[high_i]])
     )
     # Actual swapping
-    if (exponent >= 1.0) or (swap_uniform <= np.exp(exponent)):
+    if (exponent >= 0.0) or (swap_uniform <= np.exp(exponent)):
+        accepted[low_i] += 1
         # Update state->beta first
         stb[bts[low_i]] = high_i
         stb[bts[high_i]] = low_i
         # Then swap beta->state
         bts[low_i], bts[high_i] = bts[high_i], bts[low_i]
 
-START_POWER = 5 # TODO - 9
+
+START_POWER = 5
 
 @time_logging.print_time
 @njit
@@ -371,7 +351,7 @@ def ptmc(
         betas : np.ndarray,
         global_move_period : int,
         warmup_sweeps : int
-    ) -> Tuple[np.ndarray, np.ndarray]:
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Runs a Parallel-Tempering Monte Carlo simulation of an
     edwards_anderson model in a 3D cube with edge lengths size. samples
     is the number of times binding energies are recalculated and
@@ -382,7 +362,9 @@ def ptmc(
     exchange adjacent betas of the systems. Also, the sweeps are allowed 
     to reach equilibrium for some number of sweeps.
 
-    Returns some arrays with encountered values of spin and link overlap
+    Returns some arrays that act as tables for link overlap time
+    evolution, spin and link overlap histograms, and acceptance
+    frequencies.
     """
     #
     # Memory allocation, startup
@@ -400,8 +382,9 @@ def ptmc(
     # Indices here match states so that we don't have to swap with betas
     energies = np.zeros((2, len(betas)), dtype=BINDING_DTYPE)
     # Note that for overlaps, we'll save scaling for later
-    spin_overlap = np.zeros(len(betas), dtype=BINDING_DTYPE)
-    link_overlap = np.zeros(len(betas), dtype=BINDING_DTYPE)
+    # Indices match beta indices, but they are recalculated each save
+    spin_overlap = np.zeros(len(betas), dtype=OVERLAP_DTYPE)
+    link_overlap = np.zeros(len(betas), dtype=OVERLAP_DTYPE)
 
     # Logistics, counts, useful variables, ephemera arrays
     site_count = size ** 3
@@ -433,7 +416,7 @@ def ptmc(
     avg_ql = np.zeros(len(betas), dtype=BINDING_DTYPE)
     pred_norms = np.zeros(len(betas), dtype=BINDING_DTYPE)
     for bi in range(len(betas)):
-        pred_norms[bi] = (betas[bi] ** (-1)) / (site_count * 4)
+        pred_norms[bi] = 1.0 / (bind_count * betas[bi])
     # Will be initialized in loop
     era = 0
     era_len = 0
@@ -442,10 +425,15 @@ def ptmc(
     # Each subtable is count of occurrences in bins.
     # Both start at counts, will be normalized and averaged at end.
     # Will iterate through, checking if less than until end
-    bin_end_q = np.linspace(-1.0, 1.0, 201) * site_count
-    bin_end_ql = np.linspace(-1.0, 1.0, 201) * bind_count
+    q_bin_count = 2 * site_count + 1
+    ql_bin_count = 2 * bind_count + 1
     # First is of spin overlap, second is link overlap
-    obs_tbls = np.zeros((2, len(betas), 200), dtype=HIST_COUNTER_DTYPE)
+    spin_tbl = np.zeros((len(betas), q_bin_count), dtype=HIST_COUNTER_DTYPE)
+    link_tbl = np.zeros((len(betas), ql_bin_count), dtype=HIST_COUNTER_DTYPE)
+
+    # Acceptance frequencies
+    accepted = np.zeros(len(betas) - 1, dtype=HIST_COUNTER_DTYPE)
+    attempts = np.zeros(len(betas) - 1, dtype=HIST_COUNTER_DTYPE)
 
     #
     # Sampling loop
@@ -498,7 +486,7 @@ def ptmc(
                 )
 
             #
-            # Record data after equilibrium phase
+            # Record data after warmup
             #
             if swi >= warmup_sweeps:
                 # Recalculate overlaps
@@ -507,19 +495,23 @@ def ptmc(
                 # Time Evolution Tables
                 # Contribute to average (starting as sums)
                 for bi in range(len(betas)):
+                    # TODO - test absolutes here if necessary
                     avg_energies[bi] += (
                         energies[0][bts[0][bi]]
                         + energies[1][bts[1][bi]]
                     )
                     avg_ql[bi] += link_overlap[bi]
                 era_counter += 1
-                # If time to deal with table
+                # Check if time to update table
+                # Has the effect of doubling save period each time
                 if era_counter == era_len:
                     # Add to table
                     for bi in range(len(betas)):
-                        time_ev_tbls[0][bi][era] += 1 - (
-                            pred_norms[bi] * avg_energies[bi] / era_len
-                        )
+                        # TODO - test absolutes here if necessary
+                        time_ev_tbls[0][bi][era] += avg_energies[bi] / era_len
+                        #time_ev_tbls[0][bi][era] += 1 - (
+                            #pred_norms[bi] * np.abs(avg_energies[bi]) / era_len
+                        #)
                         time_ev_tbls[1][bi][era] += avg_ql[bi] / (
                             era_len * bind_count
                         )
@@ -532,11 +524,10 @@ def ptmc(
 
                 # Observation Tables (Later Histogram Tables)
                 _update_obs_tbls(
-                    obs_tbls,
+                    spin_tbl,
+                    link_tbl,
                     spin_overlap,
-                    link_overlap,
-                    bin_end_q,
-                    bin_end_ql
+                    link_overlap
                 )
 
             #
@@ -553,7 +544,9 @@ def ptmc(
                             betas,
                             bts[0],
                             stb[0],
-                            swap_uniforms[quo][swt][0]
+                            swap_uniforms[quo][swt][0],
+                            accepted,
+                            attempts
                         )
                     # Swap B
                     attempt_swap(
@@ -562,16 +555,20 @@ def ptmc(
                             betas,
                             bts[1],
                             stb[1],
-                            swap_uniforms[quo][swt][1]
+                            swap_uniforms[quo][swt][1],
+                            accepted,
+                            attempts
                         )
 
         # Endpoint of Time Evolution Table
         if era_counter != 0:
             # Add to table
             for bi in range(len(betas)):
-                time_ev_tbls[0][bi][era] += 1 - (
-                    pred_norms[bi] * avg_energies[bi] / era_counter
-                )
+                # TODO - change if necessary
+                time_ev_tbls[0][bi][era] += avg_energies[bi] / era_counter
+                #time_ev_tbls[0][bi][era] += 1 - (
+                    #pred_norms[bi] * np.abs(avg_energies[bi]) / era_counter
+                #)
                 time_ev_tbls[1][bi][era] += avg_ql[bi] / (
                     era_counter * bind_count
                 )
@@ -581,13 +578,16 @@ def ptmc(
     #
     # Turn into average
     time_ev_tbls /= samples
-    # Normalize and turn into average
-    hist_tbls = obs_tbls / (site_count * samples * sweeps)
-    # Further normalize link overlap
-    for x in range(len(hist_tbls[1])):
-        for y in range(len(hist_tbls[1][x])):
-            hist_tbls[1][x][y] /= 3
-    return time_ev_tbls, hist_tbls
+    # TODO - a small test, change to the prediction
+    for x in range(len(time_ev_tbls[0])):
+        for y in range(len(time_ev_tbls[0][x])):
+            time_ev_tbls[0][x][y] = 1 - (
+                pred_norms[x] * np.abs(time_ev_tbls[0][x][y])
+            )
+    # Turn into average
+    spin_hist_tbl = spin_tbl / (samples * sweeps)
+    link_hist_tbl = link_tbl / (samples * sweeps)
+    return time_ev_tbls, spin_hist_tbl, link_hist_tbl, (accepted / attempts)
 
 
 def alt_plot(link_overlap_hist):
@@ -646,6 +646,11 @@ def ptmc_main():
         help="Iterations to calm down."
     )
     parser.add_argument(
+        "temp_count",
+        type=int,
+        help="Number of temperatures in range"
+    )
+    parser.add_argument(
         "out_name",
         type=str,
         help="Directory to output results to."
@@ -656,6 +661,7 @@ def ptmc_main():
     sweeps = args.sweeps
     global_move_period = args.global_move_period
     warmup_sweeps = args.warmup_sweeps
+    temp_count = args.temp_count
     out_name = args.out_name
     print("...finished parsing arguments.")
 
@@ -670,10 +676,11 @@ def ptmc_main():
             "samples" : samples,
             "sweeps" : sweeps,
             "global_move_period" : global_move_period,
-            "warmup_sweeps" : warmup_sweeps
+            "warmup_sweeps" : warmup_sweeps,
+            "temp_count" : temp_count
         }, config)
     # Write meta.csv
-    temps = np.linspace(0.2, 2.0, 18)
+    temps = np.linspace(0.2, 2.0, temp_count)
     betas = temps ** (-1)
     with open(out_name + r"\meta.csv", "w") as meta:
         meta.write("Index,Beta,Temperature\n")
@@ -682,7 +689,7 @@ def ptmc_main():
     print("...finished.")
 
     # Run simulation
-    time_ev_tbls, hist_tbls = ptmc(
+    time_ev_tbls, spin_tbl, link_tbl, acceptance = ptmc(
         size,
         samples,
         sweeps,
@@ -702,12 +709,16 @@ def ptmc_main():
             lt.write(",".join([str(item) for item in row]) + "\n")
     # Write spin.csv
     with open(out_name + r"\spin.csv", "w") as spin_fd:
-        for row in hist_tbls[0]:
+        for row in spin_tbl:
             spin_fd.write(",".join([str(item) for item in row]) + "\n")
     # Write link.csv
     with open(out_name + r"\link.csv", "w") as link_fd:
-        for row in hist_tbls[0]:
+        for row in link_tbl:
             link_fd.write(",".join([str(item) for item in row]) + "\n")
+    # Write accept.csv
+    with open(out_name + r"\accept.csv", "w") as accept_fd:
+        for ratio in acceptance:
+            accept_fd.write(f"{ratio}\n")
     print("...finished.")
 
 
